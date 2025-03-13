@@ -1,280 +1,174 @@
+import streamlit as st
 import os
 import tempfile
-import streamlit as st
-import pandas as pd
-import numpy as np
-
-from langchain.document_loaders import PyPDFLoader
+import fitz  # PyMuPDF
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
 from langchain.chat_models import ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from dotenv import load_dotenv
 
-# 페이지 설정
-st.set_page_config(
-    page_title="PDF 기반 Q&A 시스템",
-    page_icon="📄",
-    layout="wide"
-)
+# 환경 변수 로드
+load_dotenv()
 
-st.title("📄 PDF 기반 Q&A 시스템")
-st.markdown("업로드한 PDF 문서를 기반으로 질문에 답변하는 시스템입니다.")
+# OpenAI API 키 설정
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 
-# API 키 입력 (Streamlit에서 getpass 대신 text_input 사용)
-api_key = st.text_input("OpenAI API 키를 입력하세요:", type="password")
-if api_key:
-    os.environ["OPENAI_API_KEY"] = api_key
+# 벡터 저장소 디렉토리 설정
+VECTOR_STORE_DIR = "vectorstore"
 
-###########################################
-# PDF 업로드 및 처리 함수 (Streamlit 버전)
-###########################################
-def upload_and_process_pdf():
-    """
-    사용자가 PDF 파일을 업로드하고 이를 처리하는 함수 (Streamlit 버전)
-    """
-    uploaded_file = st.file_uploader("PDF 파일을 업로드해주세요...", type=["pdf"])
-    if uploaded_file is None:
-        st.warning("파일이 업로드되지 않았습니다.")
-        return None, None
+def extract_text_from_pdf(pdf_file):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+        temp_file.write(pdf_file.getvalue())
+        temp_file_path = temp_file.name
 
-    filename = uploaded_file.name
-
-    # 업로드된 파일을 임시 파일에 저장
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-    temp_file.write(uploaded_file.read())
-    temp_path = temp_file.name
-    temp_file.close()
-
-    st.info(f"'{filename}' 파일이 업로드되었습니다. 처리를 시작합니다...")
-
-    # PDF 파일 로드
-    loader = PyPDFLoader(temp_path)
-    documents = loader.load()
-    st.info(f"PDF에서 {len(documents)} 페이지를 로드했습니다.")
-
-    # 텍스트 분할
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    chunks = text_splitter.split_documents(documents)
-    st.info(f"문서를 {len(chunks)} 개의 청크로 분할했습니다.")
+    doc = fitz.open(temp_file_path)
+    text = ""
+    for page in doc:
+        text += page.get_text("text") + "\n"
 
     # 임시 파일 삭제
-    os.unlink(temp_path)
+    os.unlink(temp_file_path)
+    return text
 
-    return chunks, filename
-
-document_chunks, pdf_filename = upload_and_process_pdf()
-if document_chunks is None:
-    st.stop()
-
-###########################################
-# 벡터 스토어 생성 함수
-###########################################
-def create_vector_store(chunks):
-    if chunks is None or len(chunks) == 0:
-        st.error("처리할 문서 청크가 없습니다.")
-        return None
-
-    st.info("임베딩 모델을 초기화하고 벡터 스토어를 생성합니다...")
-    # 임베딩 모델 선택
-    option = st.radio("임베딩 모델 선택", ("OpenAI 임베딩", "HuggingFace 임베딩"))
-    if option == "OpenAI 임베딩":
-        embeddings = OpenAIEmbeddings()
-        st.info("OpenAI 임베딩 모델을 사용합니다.")
-    else:
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
-        st.info("HuggingFace 임베딩 모델을 사용합니다.")
-
-    try:
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        st.success("벡터 스토어 생성이 완료되었습니다!")
-        return vector_store
-    except Exception as e:
-        st.error(f"벡터 스토어 생성 중 오류가 발생했습니다: {e}")
-        return None
-
-vector_store = create_vector_store(document_chunks)
-if vector_store is None:
-    st.stop()
-
-###########################################
-# RAG 체인 설정 함수
-###########################################
-def setup_rag_chain(vector_store):
-    if vector_store is None:
-        st.error("벡터 스토어가 없어 RAG 체인을 설정할 수 없습니다.")
-        return None
-
-    st.info("RAG 체인을 구성합니다...")
-    # 모델 선택
-    model_choice = st.radio("사용할 모델 선택", ("gpt-3.5-turbo", "gpt-4"))
-    if model_choice == "gpt-4":
-        llm = ChatOpenAI(temperature=0, model="gpt-4")
-        st.info("GPT-4 모델을 사용합니다.")
-    else:
-        llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
-        st.info("GPT-3.5-turbo 모델을 사용합니다.")
-
-    # 대화 메모리 설정
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-
-    # 검색기 설정 (상위 3개 청크 검색)
-    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-
-    # 프롬프트 템플릿 설정
-    qa_template = """
-    당신은 PDF 문서의 내용에 기반하여 질문에 답변하는 도우미입니다.
-
-    주어진 정보만을 사용하여 질문에 답변하세요. 정보가 충분하지 않다면, "주어진 문서에서 해당 정보를 찾을 수 없습니다"라고 답변하세요.
-
-    항상 문서의 내용에 충실하게 답변하고, 추측하지 마세요.
-
-    질문: {question}
-
-    관련 문서 내용:
-    {context}
-
-    답변:
-    """
-    QA_PROMPT = PromptTemplate(template=qa_template, input_variables=["question", "context"])
-
-    # RAG 체인 구성
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        combine_docs_chain_kwargs={"prompt": QA_PROMPT}
+def create_vectorstore(text, embeddings):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100,
+        separators=["\n\n", "\n", ".", " ", ""]
     )
-    st.success("RAG 체인 구성이 완료되었습니다!")
-    return qa_chain
+    documents = text_splitter.create_documents([text])
 
-qa_chain = setup_rag_chain(vector_store)
-if qa_chain is None:
-    st.stop()
+    # 청크 수 반환
+    return FAISS.from_documents(documents, embeddings), len(documents)
 
-###########################################
-# 대화형 인터페이스 (Streamlit 방식)
-###########################################
-st.header(f"{pdf_filename} 문서와 대화하기")
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+st.set_page_config(page_title="📚 PDF RAG 시스템", layout="wide")
+st.title("📚 PDF 기반 질의응답 시스템")
 
-question = st.text_input("질문을 입력하세요:")
-if st.button("전송"):
-    if question.strip() == "":
-        st.warning("질문을 입력해주세요.")
-    else:
-        st.session_state.chat_history.append({"role": "user", "content": question})
-        with st.spinner("답변을 생성 중입니다..."):
-            response = qa_chain({"question": question})
-            answer = response.get("answer", "답변 생성 실패")
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
-        st.success("답변 생성 완료!")
+with st.sidebar:
+    st.header("⚙️ 설정")
+    user_api_key = st.text_input("OpenAI API 키", value=OPENAI_API_KEY, type="password")
+    if user_api_key:
+        os.environ["OPENAI_API_KEY"] = user_api_key
 
-# 대화 이력 표시
-if st.session_state.chat_history:
-    st.subheader("대화 이력")
-    for msg in st.session_state.chat_history:
-        if msg["role"] == "user":
-            st.markdown(f"**질문:** {msg['content']}")
-        else:
-            st.markdown(f"**답변:** {msg['content']}")
+    st.markdown("---")
+    st.markdown("### 🔍 모델 설정")
+    model_name = st.selectbox(
+        "OpenAI 모델 선택",
+        ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
+        index=0
+    )
+    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
 
-###########################################
-# 대화 이력 시각화 함수 (옵션)
-###########################################
-def visualize_conversation_history(qa_chain):
-    if qa_chain is None or not hasattr(qa_chain, 'memory') or qa_chain.memory is None:
-        st.error("대화 이력을 가져올 수 없습니다.")
-        return
+    st.markdown("---")
+    st.markdown("### 📊 청크 설정")
+    chunk_size = st.slider("청크 크기", min_value=500, max_value=2000, value=1000, step=100)
+    chunk_overlap = st.slider("청크 오버랩", min_value=0, max_value=500, value=100, step=50)
 
-    chat_history = qa_chain.memory.chat_memory.messages
-    if not chat_history:
-        st.info("아직 대화 이력이 없습니다.")
-        return
+tab1, tab2 = st.tabs(["📤 PDF 업로드", "❓ 질의응답"])
 
-    st.subheader("메모리 기반 대화 이력")
-    for i, message in enumerate(chat_history):
-        if hasattr(message, 'type') and message.type == 'human':
-            st.markdown(f"**질문 {i//2 + 1}:** {message.content}")
-        elif hasattr(message, 'type') and message.type == 'ai':
-            st.markdown(f"**답변 {i//2 + 1}:** {message.content}")
-            st.markdown("---")
+with tab1:
+    st.header("PDF 파일 업로드")
+    uploaded_file = st.file_uploader("PDF 파일을 선택하세요", type="pdf")
 
-# 대화 이력 시각화 버튼
-if st.button("메모리 대화 이력 보기"):
-    visualize_conversation_history(qa_chain)
+    if uploaded_file is not None:
+        with st.spinner("PDF 파일 처리 중... 잠시만 기다려주세요."):
+            # PDF 텍스트 추출
+            text = extract_text_from_pdf(uploaded_file)
+            st.session_state.pdf_text = text
 
-###########################################
-# 다중 PDF 처리 (옵션)
-###########################################
-st.header("여러 PDF 파일 업로드 및 처리 (옵션)")
-multi_pdf_uploaded = st.file_uploader("여러 PDF 파일을 업로드하세요 (여러 파일 선택 가능)", type=["pdf"], accept_multiple_files=True)
-if multi_pdf_uploaded:
-    all_chunks = []
-    filenames = []
-    for file in multi_pdf_uploaded:
-        if not file.name.lower().endswith('.pdf'):
-            st.warning(f"'{file.name}'은(는) PDF 파일이 아닙니다. 건너뜁니다.")
-            continue
+            # 텍스트의 일부분 미리보기 표시
+            st.subheader("PDF 텍스트 미리보기")
+            st.text_area("추출된 텍스트", text[:1000] + ("..." if len(text) > 1000 else ""), height=200)
 
-        # 임시 파일로 저장
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-        temp_file.write(file.read())
-        temp_path = temp_file.name
-        temp_file.close()
-
-        st.info(f"'{file.name}' 파일을 처리합니다...")
-        try:
-            loader = PyPDFLoader(temp_path)
-            documents = loader.load()
-            st.info(f"- {len(documents)} 페이지 로드됨.")
-
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
-            chunks = text_splitter.split_documents(documents)
-            st.info(f"- {len(chunks)} 청크로 분할됨.")
-
-            # 각 청크에 파일명 추가
-            for chunk in chunks:
-                if 'source' not in chunk.metadata:
-                    chunk.metadata['source'] = file.name
-
-            all_chunks.extend(chunks)
-            filenames.append(file.name)
-        except Exception as e:
-            st.error(f"'{file.name}' 처리 중 오류 발생: {e}")
-        finally:
-            os.unlink(temp_path)
-
-    if all_chunks:
-        st.success(f"총 {len(all_chunks)} 청크가 {len(filenames)}개의 PDF에서 추출됨.")
-        # 벡터스토어 생성 (옵션)
-        try:
-            embeddings = OpenAIEmbeddings()
-            multi_vector_store = FAISS.from_documents(all_chunks, embeddings)
-            st.success("여러 PDF 벡터 스토어 생성 완료!")
-            multi_qa_chain = setup_rag_chain(multi_vector_store)
-            st.header("여러 PDF 문서와의 대화")
-            multi_question = st.text_input("여러 PDF에 대한 질문 입력:", key="multi_q")
-            if st.button("전송 (여러 PDF)"):
-                if multi_question.strip() == "":
-                    st.warning("질문을 입력해주세요.")
+            # 벡터 저장소 생성
+            if st.button("벡터 저장소 생성", use_container_width=True):
+                if not user_api_key:
+                    st.error("OpenAI API 키를 입력해주세요.")
                 else:
-                    with st.spinner("답변 생성 중..."):
-                        multi_response = multi_qa_chain({"question": multi_question})
-                        multi_answer = multi_response.get("answer", "답변 생성 실패")
-                    st.success("답변 생성 완료!")
-                    st.markdown(f"**답변:** {multi_answer}")
-        except Exception as e:
-            st.error(f"다중 PDF 벡터 스토어 생성 중 오류: {e}")
-    else:
-        st.warning("처리된 PDF 문서가 없습니다.")
+                    with st.spinner("벡터 저장소 생성 중... 이 작업은 몇 분 정도 소요될 수 있습니다."):
+                        try:
+                            embeddings = OpenAIEmbeddings()
 
+                            # 사용자 정의 청크 설정 적용
+                            text_splitter = RecursiveCharacterTextSplitter(
+                                chunk_size=chunk_size,
+                                chunk_overlap=chunk_overlap
+                            )
+                            documents = text_splitter.create_documents([text])
+
+                            # 벡터 저장소 생성
+                            vectorstore = FAISS.from_documents(documents, embeddings)
+
+                            # 세션에 저장
+                            st.session_state.vectorstore = vectorstore
+                            st.session_state.document_chunks = len(documents)
+
+                            # 성공 메시지
+                            st.success(f"✅ 벡터 저장소 생성 완료! {len(documents)}개의 청크로 분할되었습니다.")
+                            st.info("이제 '질의응답' 탭에서 질문을 해보세요!")
+                        except Exception as e:
+                            st.error(f"오류 발생: {str(e)}")
+
+with tab2:
+    st.header("PDF 기반 질의응답")
+
+    # 벡터 저장소가 생성되었는지 확인
+    if 'vectorstore' not in st.session_state:
+        st.warning("먼저 'PDF 업로드' 탭에서 PDF를 업로드하고 벡터 저장소를 생성해주세요.")
+    else:
+        st.success(f"✅ {st.session_state.get('document_chunks', 0)}개의 청크가 준비되었습니다.")
+
+        # 질문 입력
+        query = st.text_input("질문을 입력하세요", placeholder="예: 이 문서의 주요 내용은 무엇인가요?")
+
+        if query:
+            # 사용자가 입력한 API 키 확인
+            if not user_api_key:
+                st.error("OpenAI API 키를 입력해주세요.")
+            else:
+                with st.spinner("답변 생성 중..."):
+                    try:
+                        # LLM 및 검색 체인 설정
+                        llm = ChatOpenAI(
+                            model_name=model_name,
+                            temperature=temperature
+                        )
+
+                        # 검색기 설정
+                        retriever = st.session_state.vectorstore.as_retriever(
+                            search_type="similarity",
+                            search_kwargs={"k": 3}
+                        )
+
+                        # QA 체인 생성
+                        qa_chain = RetrievalQA.from_chain_type(
+                            llm=llm,
+                            chain_type="stuff",
+                            retriever=retriever,
+                            return_source_documents=True
+                        )
+
+                        # 질의응답 실행
+                        result = qa_chain({"query": query})
+
+                        # 결과 표시
+                        st.subheader("📝 답변")
+                        st.write(result["result"])
+
+                        # 참조 문서 표시
+                        with st.expander("📚 참조된 문서 청크"):
+                            for i, doc in enumerate(result["source_documents"]):
+                                st.markdown(f"**청크 {i+1}**")
+                                st.text(doc.page_content)
+                                st.markdown("---")
+
+                    except Exception as e:
+                        st.error(f"오류 발생: {str(e)}")
+
+# 푸터
 st.markdown("---")
-st.caption("© 2023 학생 성적 관리 대시보드 | Streamlit으로 제작되었습니다")
+st.caption("멋쟁이 사자처럼")
