@@ -7,7 +7,7 @@ llm = ChatOllama(model="mistral:7b")
 
 # role = "<<ROLE DESCRIPTION>>"
 messages = [
-    SystemMessage(f"정체가 뭐야"),
+    SystemMessage(f"당신은 개발자 입니다."),
     HumanMessage("당신을 소개해주세요."),
 ]
 
