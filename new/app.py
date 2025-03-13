@@ -1,247 +1,280 @@
+import os
+import tempfile
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
 
 # 페이지 설정
 st.set_page_config(
-    page_title="판매 데이터 시각화",
-    page_icon="📊",
+    page_title="PDF 기반 Q&A 시스템",
+    page_icon="📄",
     layout="wide"
 )
 
-# 앱 제목
-st.title("📊 월별 판매 데이터 시각화")
-st.markdown("다양한 차트를 통해 판매 데이터를 시각화하는 앱입니다.")
+st.title("📄 PDF 기반 Q&A 시스템")
+st.markdown("업로드한 PDF 문서를 기반으로 질문에 답변하는 시스템입니다.")
 
-# 1. 데이터프레임 생성 (요구사항 1)
-@st.cache_data
-def generate_sales_data():
-    # 랜덤 시드 설정으로 일관된 데이터 생성
-    np.random.seed(42)
-    
-    # 월별 데이터 생성
-    months = [f"{i}월" for i in range(1, 13)]
-    
-    # 무작위 판매량 생성 (50~200 사이)
-    product_a = np.random.randint(50, 201, size=12)
-    product_b = np.random.randint(50, 201, size=12)
-    product_c = np.random.randint(50, 201, size=12)
-    
-    # 데이터프레임 생성
-    df = pd.DataFrame({
-        '월': months,
-        '상품A': product_a,
-        '상품B': product_b,
-        '상품C': product_c
-    })
-    
-    # 무작위 위치 데이터 생성 (한국 지역 위주)
-    locations = pd.DataFrame({
-        '지역': ['서울', '부산', '인천', '대구', '광주', '대전', '울산', '세종', '경기', '강원', '충북', '충남'],
-        'lat': [37.5665, 35.1796, 37.4563, 35.8714, 35.1595, 36.3504, 35.5384, 36.4800, 37.4138, 37.8228, 36.6357, 36.6588],
-        'lon': [126.9780, 129.0756, 126.7052, 128.6014, 126.8526, 127.3845, 129.3114, 127.2890, 127.5183, 128.1555, 127.4914, 126.8000],
-        '판매량': np.random.randint(100, 1001, size=12)
-    })
-    
-    return df, locations
+# API 키 입력 (Streamlit에서 getpass 대신 text_input 사용)
+api_key = st.text_input("OpenAI API 키를 입력하세요:", type="password")
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
 
-# 데이터 생성
-sales_df, locations_df = generate_sales_data()
+###########################################
+# PDF 업로드 및 처리 함수 (Streamlit 버전)
+###########################################
+def upload_and_process_pdf():
+    """
+    사용자가 PDF 파일을 업로드하고 이를 처리하는 함수 (Streamlit 버전)
+    """
+    uploaded_file = st.file_uploader("PDF 파일을 업로드해주세요...", type=["pdf"])
+    if uploaded_file is None:
+        st.warning("파일이 업로드되지 않았습니다.")
+        return None, None
 
-# 사이드바 - 필터링 및 옵션
-st.sidebar.header("데이터 필터 및 옵션")
+    filename = uploaded_file.name
 
-# 제품 선택 (도전 과제)
-selected_products = st.sidebar.multiselect(
-    "시각화할 제품 선택",
-    ["상품A", "상품B", "상품C"],
-    default=["상품A", "상품B", "상품C"]
-)
+    # 업로드된 파일을 임시 파일에 저장
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    temp_file.write(uploaded_file.read())
+    temp_path = temp_file.name
+    temp_file.close()
 
-# 월 범위 선택 (도전 과제)
-months_range = st.sidebar.slider(
-    "월 범위 선택",
-    1, 12, (1, 12),
-    step=1
-)
+    st.info(f"'{filename}' 파일이 업로드되었습니다. 처리를 시작합니다...")
 
-# 선택된 월 범위에 따라 데이터 필터링
-filtered_df = sales_df.iloc[(months_range[0]-1):months_range[1]]
+    # PDF 파일 로드
+    loader = PyPDFLoader(temp_path)
+    documents = loader.load()
+    st.info(f"PDF에서 {len(documents)} 페이지를 로드했습니다.")
 
-# 선택된 제품만 포함하는 데이터프레임 생성
-filtered_products_df = filtered_df[['월'] + selected_products]
-
-# 데이터 탭과 시각화 탭 생성
-tab1, tab2 = st.tabs(["📋 데이터", "📊 시각화"])
-
-with tab1:
-    st.header("판매 데이터")
-    st.dataframe(filtered_products_df, use_container_width=True)
-    
-    # 데이터 요약 정보
-    st.subheader("데이터 요약")
-    
-    # 총 판매량 계산
-    total_sales = {}
-    for product in selected_products:
-        total_sales[product] = filtered_df[product].sum()
-    
-    # 총 판매량 표시
-    col1, col2, col3 = st.columns(3)
-    
-    for i, (product, sales) in enumerate(total_sales.items()):
-        if i == 0:
-            col1.metric(f"{product} 총 판매량", f"{sales:,}개")
-        elif i == 1:
-            col2.metric(f"{product} 총 판매량", f"{sales:,}개")
-        else:
-            col3.metric(f"{product} 총 판매량", f"{sales:,}개")
-    
-    # 월별 총 판매량 계산
-    filtered_df['월별 총 판매량'] = filtered_df[selected_products].sum(axis=1)
-    
-    # 상위 판매월 표시
-    st.subheader("상위 판매월")
-    top_months = filtered_df[['월', '월별 총 판매량']].sort_values('월별 총 판매량', ascending=False).head(3)
-    st.dataframe(top_months, use_container_width=True)
-
-with tab2:
-    st.header("판매 데이터 시각화")
-    
-    # 2. 월별 판매량 막대 그래프 (요구사항 2)
-    st.subheader("월별 판매량 막대 그래프")
-    
-    bar_fig = px.bar(
-        filtered_products_df, 
-        x='월', 
-        y=selected_products,
-        title='월별 제품 판매량',
-        labels={'월': '월', 'value': '판매량', 'variable': '제품'},
-        barmode='group'
+    # 텍스트 분할
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
     )
-    
-    st.plotly_chart(bar_fig, use_container_width=True)
-    
-    # 3. 총 판매량 파이 차트 (요구사항 3)
-    st.subheader("제품별 총 판매량 파이 차트")
-    
-    # 총 판매량 계산
-    total_by_product = {}
-    for product in selected_products:
-        total_by_product[product] = filtered_df[product].sum()
-    
-    # 파이 차트 생성
-    pie_fig = px.pie(
-        values=list(total_by_product.values()),
-        names=list(total_by_product.keys()),
-        title='제품별 총 판매량 비중',
-        hole=0.3,
-    )
-    
-    st.plotly_chart(pie_fig, use_container_width=True)
-    
-    # 4. 월별 판매 트렌드 선 그래프 (요구사항 4)
-    st.subheader("월별 판매 트렌드")
-    
-    line_fig = px.line(
-        filtered_products_df, 
-        x='월', 
-        y=selected_products,
-        title='월별 판매 추이',
-        labels={'월': '월', 'value': '판매량', 'variable': '제품'},
-        markers=True,
-        line_shape='linear'
-    )
-    
-    st.plotly_chart(line_fig, use_container_width=True)
-    
-    # 5. 제품 간 상관관계 산점도 (요구사항 5)
-    if len(selected_products) >= 2:
-        st.subheader("제품 간 상관관계 산점도")
-        
-        # 산점도에 사용할 두 제품 선택
-        scatter_col1, scatter_col2 = st.columns(2)
-        
-        with scatter_col1:
-            x_product = st.selectbox("X축 제품", selected_products, index=0)
-        
-        with scatter_col2:
-            # x_product와 다른 제품을 y축 기본값으로 설정
-            default_y_index = 1 if selected_products[0] == x_product else 0
-            y_product = st.selectbox("Y축 제품", selected_products, index=default_y_index)
-        
-        # 산점도 생성
-        scatter_fig = px.scatter(
-            filtered_df, 
-            x=x_product, 
-            y=y_product,
-            trendline="ols",  # 추세선 추가
-            title=f'{x_product}와 {y_product} 판매량 상관관계',
-            labels={x_product: f'{x_product} 판매량', y_product: f'{y_product} 판매량'},
-            hover_data=['월']  # 호버 시 월 정보 표시
-        )
-        
-        # 상관계수 계산
-        correlation = filtered_df[x_product].corr(filtered_df[y_product])
-        scatter_fig.add_annotation(
-            x=0.95, y=0.05,
-            xref="paper", yref="paper",
-            text=f"상관계수: {correlation:.2f}",
-            showarrow=False,
-            font=dict(size=12),
-            bgcolor="rgba(255, 255, 255, 0.8)",
-            bordercolor="black",
-            borderwidth=1,
-            borderpad=4
-        )
-        
-        st.plotly_chart(scatter_fig, use_container_width=True)
+    chunks = text_splitter.split_documents(documents)
+    st.info(f"문서를 {len(chunks)} 개의 청크로 분할했습니다.")
+
+    # 임시 파일 삭제
+    os.unlink(temp_path)
+
+    return chunks, filename
+
+document_chunks, pdf_filename = upload_and_process_pdf()
+if document_chunks is None:
+    st.stop()
+
+###########################################
+# 벡터 스토어 생성 함수
+###########################################
+def create_vector_store(chunks):
+    if chunks is None or len(chunks) == 0:
+        st.error("처리할 문서 청크가 없습니다.")
+        return None
+
+    st.info("임베딩 모델을 초기화하고 벡터 스토어를 생성합니다...")
+    # 임베딩 모델 선택
+    option = st.radio("임베딩 모델 선택", ("OpenAI 임베딩", "HuggingFace 임베딩"))
+    if option == "OpenAI 임베딩":
+        embeddings = OpenAIEmbeddings()
+        st.info("OpenAI 임베딩 모델을 사용합니다.")
     else:
-        st.warning("산점도를 표시하려면 최소 2개 이상의 제품을 선택하세요.")
-    
-    # 6. 판매 위치 지도 시각화 (요구사항 6)
-    st.subheader("지역별 판매 위치")
-    
-    map_fig = px.scatter_mapbox(
-        locations_df, 
-        lat="lat", 
-        lon="lon", 
-        hover_name="지역", 
-        size="판매량",
-        color="판매량",
-        color_continuous_scale=px.colors.cyclical.IceFire,
-        zoom=6,
-        mapbox_style="carto-positron",
-        title="지역별 판매량"
-    )
-    
-    st.plotly_chart(map_fig, use_container_width=True)
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+        st.info("HuggingFace 임베딩 모델을 사용합니다.")
 
-# 추가 분석 - 제품 비교 히트맵
-st.header("추가 분석: 월별 제품 판매 비교")
+    try:
+        vector_store = FAISS.from_documents(chunks, embeddings)
+        st.success("벡터 스토어 생성이 완료되었습니다!")
+        return vector_store
+    except Exception as e:
+        st.error(f"벡터 스토어 생성 중 오류가 발생했습니다: {e}")
+        return None
 
-if len(selected_products) >= 2:
-    # 히트맵 생성
-    heatmap_data = filtered_df.pivot_table(
-        index='월', 
-        values=selected_products
-    )
-    
-    heatmap_fig = px.imshow(
-        heatmap_data,
-        title="월별 제품 판매량 히트맵",
-        labels=dict(x="제품", y="월", color="판매량"),
-        color_continuous_scale="Viridis",
-        aspect="auto"
-    )
-    
-    st.plotly_chart(heatmap_fig, use_container_width=True)
-else:
-    st.warning("히트맵을 표시하려면 최소 2개 이상의 제품을 선택하세요.")
+vector_store = create_vector_store(document_chunks)
+if vector_store is None:
+    st.stop()
 
-# 푸터
+###########################################
+# RAG 체인 설정 함수
+###########################################
+def setup_rag_chain(vector_store):
+    if vector_store is None:
+        st.error("벡터 스토어가 없어 RAG 체인을 설정할 수 없습니다.")
+        return None
+
+    st.info("RAG 체인을 구성합니다...")
+    # 모델 선택
+    model_choice = st.radio("사용할 모델 선택", ("gpt-3.5-turbo", "gpt-4"))
+    if model_choice == "gpt-4":
+        llm = ChatOpenAI(temperature=0, model="gpt-4")
+        st.info("GPT-4 모델을 사용합니다.")
+    else:
+        llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+        st.info("GPT-3.5-turbo 모델을 사용합니다.")
+
+    # 대화 메모리 설정
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+    # 검색기 설정 (상위 3개 청크 검색)
+    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+
+    # 프롬프트 템플릿 설정
+    qa_template = """
+    당신은 PDF 문서의 내용에 기반하여 질문에 답변하는 도우미입니다.
+
+    주어진 정보만을 사용하여 질문에 답변하세요. 정보가 충분하지 않다면, "주어진 문서에서 해당 정보를 찾을 수 없습니다"라고 답변하세요.
+
+    항상 문서의 내용에 충실하게 답변하고, 추측하지 마세요.
+
+    질문: {question}
+
+    관련 문서 내용:
+    {context}
+
+    답변:
+    """
+    QA_PROMPT = PromptTemplate(template=qa_template, input_variables=["question", "context"])
+
+    # RAG 체인 구성
+    qa_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT}
+    )
+    st.success("RAG 체인 구성이 완료되었습니다!")
+    return qa_chain
+
+qa_chain = setup_rag_chain(vector_store)
+if qa_chain is None:
+    st.stop()
+
+###########################################
+# 대화형 인터페이스 (Streamlit 방식)
+###########################################
+st.header(f"{pdf_filename} 문서와 대화하기")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+question = st.text_input("질문을 입력하세요:")
+if st.button("전송"):
+    if question.strip() == "":
+        st.warning("질문을 입력해주세요.")
+    else:
+        st.session_state.chat_history.append({"role": "user", "content": question})
+        with st.spinner("답변을 생성 중입니다..."):
+            response = qa_chain({"question": question})
+            answer = response.get("answer", "답변 생성 실패")
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+        st.success("답변 생성 완료!")
+
+# 대화 이력 표시
+if st.session_state.chat_history:
+    st.subheader("대화 이력")
+    for msg in st.session_state.chat_history:
+        if msg["role"] == "user":
+            st.markdown(f"**질문:** {msg['content']}")
+        else:
+            st.markdown(f"**답변:** {msg['content']}")
+
+###########################################
+# 대화 이력 시각화 함수 (옵션)
+###########################################
+def visualize_conversation_history(qa_chain):
+    if qa_chain is None or not hasattr(qa_chain, 'memory') or qa_chain.memory is None:
+        st.error("대화 이력을 가져올 수 없습니다.")
+        return
+
+    chat_history = qa_chain.memory.chat_memory.messages
+    if not chat_history:
+        st.info("아직 대화 이력이 없습니다.")
+        return
+
+    st.subheader("메모리 기반 대화 이력")
+    for i, message in enumerate(chat_history):
+        if hasattr(message, 'type') and message.type == 'human':
+            st.markdown(f"**질문 {i//2 + 1}:** {message.content}")
+        elif hasattr(message, 'type') and message.type == 'ai':
+            st.markdown(f"**답변 {i//2 + 1}:** {message.content}")
+            st.markdown("---")
+
+# 대화 이력 시각화 버튼
+if st.button("메모리 대화 이력 보기"):
+    visualize_conversation_history(qa_chain)
+
+###########################################
+# 다중 PDF 처리 (옵션)
+###########################################
+st.header("여러 PDF 파일 업로드 및 처리 (옵션)")
+multi_pdf_uploaded = st.file_uploader("여러 PDF 파일을 업로드하세요 (여러 파일 선택 가능)", type=["pdf"], accept_multiple_files=True)
+if multi_pdf_uploaded:
+    all_chunks = []
+    filenames = []
+    for file in multi_pdf_uploaded:
+        if not file.name.lower().endswith('.pdf'):
+            st.warning(f"'{file.name}'은(는) PDF 파일이 아닙니다. 건너뜁니다.")
+            continue
+
+        # 임시 파일로 저장
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        temp_file.write(file.read())
+        temp_path = temp_file.name
+        temp_file.close()
+
+        st.info(f"'{file.name}' 파일을 처리합니다...")
+        try:
+            loader = PyPDFLoader(temp_path)
+            documents = loader.load()
+            st.info(f"- {len(documents)} 페이지 로드됨.")
+
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
+            chunks = text_splitter.split_documents(documents)
+            st.info(f"- {len(chunks)} 청크로 분할됨.")
+
+            # 각 청크에 파일명 추가
+            for chunk in chunks:
+                if 'source' not in chunk.metadata:
+                    chunk.metadata['source'] = file.name
+
+            all_chunks.extend(chunks)
+            filenames.append(file.name)
+        except Exception as e:
+            st.error(f"'{file.name}' 처리 중 오류 발생: {e}")
+        finally:
+            os.unlink(temp_path)
+
+    if all_chunks:
+        st.success(f"총 {len(all_chunks)} 청크가 {len(filenames)}개의 PDF에서 추출됨.")
+        # 벡터스토어 생성 (옵션)
+        try:
+            embeddings = OpenAIEmbeddings()
+            multi_vector_store = FAISS.from_documents(all_chunks, embeddings)
+            st.success("여러 PDF 벡터 스토어 생성 완료!")
+            multi_qa_chain = setup_rag_chain(multi_vector_store)
+            st.header("여러 PDF 문서와의 대화")
+            multi_question = st.text_input("여러 PDF에 대한 질문 입력:", key="multi_q")
+            if st.button("전송 (여러 PDF)"):
+                if multi_question.strip() == "":
+                    st.warning("질문을 입력해주세요.")
+                else:
+                    with st.spinner("답변 생성 중..."):
+                        multi_response = multi_qa_chain({"question": multi_question})
+                        multi_answer = multi_response.get("answer", "답변 생성 실패")
+                    st.success("답변 생성 완료!")
+                    st.markdown(f"**답변:** {multi_answer}")
+        except Exception as e:
+            st.error(f"다중 PDF 벡터 스토어 생성 중 오류: {e}")
+    else:
+        st.warning("처리된 PDF 문서가 없습니다.")
+
 st.markdown("---")
-st.caption("© 멋쟁이사자처럼")   
+st.caption("© 2023 학생 성적 관리 대시보드 | Streamlit으로 제작되었습니다")
